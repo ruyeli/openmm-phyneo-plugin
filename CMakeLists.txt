@@ -41,6 +41,9 @@ else()
     set(OPENMM_TARGET OpenMM)
 endif()
 
+# CUDA/test targets still use unqualified OpenMM library names with either
+# modern OpenMMConfig or legacy discovery.
+link_directories("${OPENMM_DIR}/lib" "${OPENMM_DIR}/lib/plugins")
 # set flags for linking on mac
 IF(APPLE)
     SET (CMAKE_INSTALL_NAME_DIR "@rpath")

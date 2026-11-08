@@ -1,0 +1,34 @@
+{
+  "input_sha256": "cfbf80244797035dbe303f1e66b2d065ad8cec317827ab9a9fb95727e3f13f86",
+  "jax": "0.4.21",
+  "devices": [
+    "TFRT_CPU_0"
+  ],
+  "grid": [
+    98,
+    98,
+    98
+  ],
+  "alpha_per_nm": 4.864038443120718,
+  "atoms": 400,
+  "pairs": 4737,
+  "timings": {
+    "pme_compile_evaluate_s": 2.6276847121771425,
+    "pme_warm_s": 0.3865239869337529,
+    "cutoff_compile_evaluate_s": 0.6472643900196999,
+    "cutoff_warm_s": 0.0004944710526615381,
+    "correction_compile_evaluate_s": 2.3733702450990677,
+    "correction_warm_s": 0.3959860159084201
+  },
+  "energies": {
+    "pme_energy": -101.08062177136725,
+    "cutoff_energy": -86.21009697480979,
+    "correction_energy": -14.870524796557461
+  },
+  "source_sha256": {
+    "admp/disp_pme.py": "8affaaa10c04ada4c6fd761842c0bef457760b19c3d8c211b799846038057aad",
+    "admp/recip.py": "0516db30935609cb79fcff075dfead93573cb3788bd2c4e0c0ec7eb4aa6b176e",
+    "admp/pme.py": "72ee1a4636637ac82bd007659c445f7fd6d5116092e971cdb679191b5e4b2687",
+    "generators/admp.py": "ea74b79185b82d81eaee041979856f64ccd82827720811542fbcd0b7ad16b991"
+  }
+}

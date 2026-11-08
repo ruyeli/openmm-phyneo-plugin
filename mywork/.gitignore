@@ -1,0 +1,16 @@
+build_manifest.json
+runs/
+native_dispersion/build/
+native_dispersion/results/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.so
+*.o
+*.dcd
+*.chk
+*.nsys-rep
+*.sqlite*
+*.log
+slurm-*.out
+validation/

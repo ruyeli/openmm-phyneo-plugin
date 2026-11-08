@@ -1,0 +1,23 @@
+Native C6/C8/C10 dispersion PME-minus-cutoff prototype
+
+The dispersion Ewald functions, self terms, mesh convention and sixth-order
+cardinal B-spline formulas are adapted from DMFF:
+  dmff/admp/disp_pme.py
+  dmff/admp/recip.py
+  dmff/generators/admp.py
+  source checkout commit 92234e930af1a2ef7694744282378c3d65e8d82a
+DMFF is distributed under GNU LGPL version 3; its license is retained in
+LICENSE.DMFF. Adaptations in src/DispersionMath.h, CpuEngine.cpp and CudaEngine.cu
+include translation to C++/CUDA, analytic force gathering, stable symmetric
+B-spline evaluation, and a stable small-argument real-space complement.
+No original DMFF source or environment was modified.
+
+vendor/pocketfft_hdronly.h is copied from the local OpenMM source dependency.
+Its original copyright and BSD license notices are retained in the header.
+It implements the CPU FFT. CUDA execution uses NVIDIA cuFFT from the installed
+CUDA toolkit. NVIDIA libraries and OpenMM binaries are not redistributed here.
+
+The native OpenMM adapter is experimental: it dispatches directly from ForceImpl
+to a C++ engine instead of a separate KernelFactory per platform. The Python
+binding only constructs the native force via a C ABI; there are NO Python force
+callbacks and NO JAX runtime calls during OpenMM energy/force evaluations.

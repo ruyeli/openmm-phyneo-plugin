@@ -1,0 +1,3 @@
+# Preserve fixed-column structures and original reference inputs byte-for-byte.
+*.pdb -text whitespace=-blank-at-eol
+npt_ts_1fs/*.xml -text whitespace=-blank-at-eol

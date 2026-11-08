@@ -1,4 +1,5 @@
 build
+build-portable/
 build_phyneo
 openmm_build/
 docs/superpowers/

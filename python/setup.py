@@ -12,6 +12,8 @@ phyneoplugin_library_dir = '@PHYNEO_PLUGIN_LIBRARY_DIR@'
 # setup extra compile and link arguments on Mac
 extra_compile_args = []
 extra_link_args = []
+if platform.system() == 'Linux':
+    extra_link_args += ['-Wl,-rpath,'+os.path.join(openmm_dir, 'lib')]
 
 if platform.system() == 'Darwin':
     extra_compile_args += ['-stdlib=libc++', '-mmacosx-version-min=10.7']

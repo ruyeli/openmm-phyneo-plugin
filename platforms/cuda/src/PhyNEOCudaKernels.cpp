@@ -735,12 +735,17 @@ void CudaCalcPhyNEOForceKernel::initializeScaleFactors() {
             }
         }
     }
+    // Avoid int overflow in CudaArray::upload for scale matrices above 2 GiB.
+    auto uploadScaleFactors = [&](CudaArray& array, const vector<float>& values) {
+        CUresult result = cuMemcpyHtoD(array.getDevicePointer(), values.data(), values.size()*sizeof(float));
+        CHECK_RESULT(result, "Error uploading array " + array.getName());
+    };
     mScaleFactors = CudaArray::create<float>(cu, numAtoms * numAtoms, "mScaleFactors");
-    mScaleFactors->upload(mScaleFactorsVec);
+    uploadScaleFactors(*mScaleFactors, mScaleFactorsVec);
     pScaleFactors = CudaArray::create<float>(cu, numAtoms * numAtoms, "pScaleFactors");
-    pScaleFactors->upload(pScaleFactorsVec);
+    uploadScaleFactors(*pScaleFactors, pScaleFactorsVec);
     dScaleFactors = CudaArray::create<float>(cu, numAtoms * numAtoms, "dScaleFactors");
-    dScaleFactors->upload(dScaleFactorsVec);
+    uploadScaleFactors(*dScaleFactors, dScaleFactorsVec);
 
     // Figure out the covalent flag values to use for each atom pair.
     // Note: The f1/f2 bit-encoding is kept for compatibility with existing kernel logic
