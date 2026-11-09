@@ -1,8 +1,9 @@
 Portable hexane OPLS + PhyNEO physical-potential workflow
 ======================================================
 
-This branch carries the current implementation, not a performance-optimized
-release. No ML bonding or JAX runtime is used by the OpenMM MD runner.
+This branch carries the optimized implementation: GPU dispersion neighbor
+lists and real FFTs for dispersion and double-precision orthorhombic
+electrostatics. It remains experimental. No ML bonding or JAX runtime is used.
 The original upstream README still describes the general plugin.
 
 On the destination Linux GPU cluster:
@@ -23,8 +24,8 @@ Build and validation must run in an allocation with CUDA/GPU access. The native
 CUDA architecture defaults to the build GPU; rebuild for different GPUs (or set
 PHYNEO_CUDA_ARCHITECTURES to an appropriate CMake architecture list). Compiler,
 toolkit and driver must be mutually compatible. BUILD_JOBS defaults to 2.
-This portable build path has only received static/argument checks on the source
-cluster's login node; compile and validate it on the destination before MD.
+Compile and validate on the destination before MD; historical source-cluster
+results do not certify a new compiler, GPU or OpenMM environment.
 This handoff adds no precompiled libraries or build caches. Legacy upstream
 build artifacts may exist in the inherited tree; do not use them. Validation records are
 local, ignored by Git, and tied to source, model, environment and binary hashes.
@@ -37,7 +38,8 @@ Defaults: 1 fs, CUDA double, mutual polarization tolerance 1e-5, max 1000
 iterations, 0.6 nm cutoff, 1 bar isotropic NPT. Use NVT for the fixed-box slab.
 DCD/checkpoint/CSV are written every 1 ps; one final structure PDB is written,
 not a PDB trajectory. Set PHYNEO_OUTPUT_DIR to a scratch/project filesystem.
-Each run creates a unique directory. The runner does not automatically resume.
+Each run creates a unique directory. For checkpoint continuation use
+continue_hexane_realfft.py or continue_phyneo_realfft.sh, described below.
 Transfer existing trajectories/checkpoints separately if you need them;
 Git carries implementation and starting configurations, not simulation history.
 
@@ -53,6 +55,8 @@ override those defaults. The 48-hour limit is not a promise any duration fits.
 Included: 20-molecule vapor, 100-molecule liquid, repaired 1323-molecule slab,
 converted XML, original physical output.xml and OPLS LIG.openmm.xml, converter,
 parameter-construction script, regression tests and CPU-DMFF vapor fixtures.
+Those regression files/fixtures were already present in the earlier branch.
+This optimization update adds no test files, diagnostic folders or raw logs.
 The converter accepts connectivity-bearing OPLS PDBs; see --help. It is for
 linear hexane, not an arbitrary chemistry/topology conversion.
 
@@ -89,10 +93,72 @@ raw dispersion, not a full independent reference for every force component.
 validate_build.py also runs plugin/native CTest, model/scaling tests and a short
 hybrid CUDA-double MD smoke test. Inspect failed logs rather than bypassing it.
 
-Latest profiling: about 0.38 ns/day for the 1323-molecule slab on RTX PRO 6000
-Blackwell (roughly 229 ms/step). Native correction costs about 166 ms/step:
-all-pairs real space ~74 ms, FFT ~62 ms, reciprocal Green evaluation ~22 ms.
-Reporting/actual transfer costs are small. These optimizations remain pending:
-neighbor lists, NVT Green caching and same-grid FFT work. Rounding the grid is
-not adopted because it changes the DMFF comparison. Raw profiler metadata stays local.
-No optimization or new GPU calculation was done during this Git handoff.
+Implemented optimizations
+-------------------------
+Dispersion now uses a GPU cell/Verlet neighbor list with a 0.2 nm skin and
+displacement/box-change rebuilds. Required bonded correction pairs are retained.
+Box-dependent reciprocal factors are cached until the box changes. Each of
+C6/C8/C10 uses double real-to-complex/complex-to-real FFTs on the unchanged mesh;
+half-spectrum energy weights preserve zero and Nyquist conventions.
+
+Permanent and induced-dipole PME use double real FFTs for initially
+orthorhombic boxes. Single/mixed precision and initially triclinic boxes retain
+complex FFTs. The odd-grid reciprocal multiplier is conjugate-averaged to
+preserve the legacy real-valued result. Complex Fourier coefficients remain
+in the nonredundant half-spectrum; imaginary information is not discarded.
+The redundant initial induced-field FFT pair is skipped only in Mutual mode
+with iterations; convergence tolerance and iteration count are unchanged.
+Five polarization iterations now mean 18 transforms per full force evaluation:
+2 permanent + 10 induced + 6 dispersion, all real FFTs for this runner.
+No grid rounding, warm starts, cross-component FFT reuse or model changes.
+
+Latest source-cluster measurements, RTX PRO 6000 Blackwell, 1323 molecules:
+  complex electrostatics + optimized real dispersion: 112.54 ms/step;
+  real electrostatics + optimized real dispersion:     97.50 ms/step.
+The latter is 0.886 ns/day at 1 fs, 15.4% higher throughput. These were paired
+2000-step timings; gains for the 100-molecule box were much smaller (~1%).
+Forty matched NVE/NPT snapshots agreed within 6.6e-12 kJ/mol in energy,
+1.7e-9 kJ/mol/nm in force, and 8.6e-14 e nm in induced dipoles.
+Changed-box and checkpoint-continuation checks passed. Full damped dispersion
+agreement with CPU DMFF is retained at the tolerances described above.
+
+Important limits: both FFT builds show substantial total-energy fluctuations
+in the short NVE checks. Earlier full initcheck reported 5127 warnings in each
+build, with identical counts outside the changed FFT kernels; their physical
+relevance remains unresolved. Fresh-context replay also differs slightly from
+stored MD evaluations in both builds. FFT equivalence is not proof of full
+energy conservation, initialization safety or long-time ensemble accuracy.
+Raw diagnostics, test outputs, build products and trajectories stay off Git.
+
+Continuation with all real FFTs
+------------------------------
+With the local build validated, from repository/mywork:
+  python -u -B continue_hexane_realfft.py /path/to/source_run
+or:
+  sbatch --account=YOUR_ACCOUNT --partition=YOUR_GPU_PARTITION continue_phyneo_realfft.sh /path/to/source_run
+An optional final argument is an ADDITIONAL duration in ps. Without it, resume
+until the source manifest's original total target step. For example, a source
+checkpoint at 783 ps in a 10 ns run has 9217 ps remaining.
+
+The runner requires source_run/run.json and restart.chk, plus the original
+topology PDB with matching hash. If its path changed, set PHYNEO_INPUT_PDB to
+the transferred identical PDB. The new libraries are selected from the local
+build manifest, never from stale source-run binary paths. Physical settings,
+OpenMM version, box and PME meshes must match. Binary checkpoints can still
+be incompatible across GPU/platform/OpenMM environments: failure is explicit,
+with no silent PDB/State fallback.
+
+No minimization or velocity reassignment follows checkpoint loading. A new
+uniquely named directory is created beside the source (or in PHYNEO_OUTPUT_DIR).
+It contains DCD/CSV, atomically replaced checkpoints, provenance and final State
+XML; no PDB trajectory. Standard OpenMM DCD segment numbering is retained.
+The source run is never appended to or overwritten.
+
+The 48-hour Slurm template requests a stop signal 180 seconds before expiry;
+the runner checks signals every <=1000 steps and saves a restart. Hard kills
+cannot be caught. At 0.886 ns/day, another 9.217 ns takes roughly 10.4 days,
+requiring several allocations. Resubmit with the NEW output directory as
+source_run; omitting duration preserves its outstanding target_total_steps.
+No automatic job submission/chaining is performed. The source-cluster runner
+passed a 10-step original-checkpoint restart followed by a 5-step restart of
+that new checkpoint. Slurm wall-time expiry itself was not smoke-tested.

@@ -1,9 +1,8 @@
+CMAKE_MINIMUM_REQUIRED(VERSION 3.24)
 PROJECT(PhyNEOOpenMMPlugin)
 #---------------------------------------------------
 # OpenMM PhyNEO Plugin
 #----------------------------------------------------
-
-CMAKE_MINIMUM_REQUIRED(VERSION 3.16)
 
 # Prefer modern OpenMMConfig.cmake (OpenMM 8.x), keep OPENMM_DIR fallback for legacy installs.
 SET(OPENMM_DIR "" CACHE PATH "Where OpenMM is installed (legacy fallback)")

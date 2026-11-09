@@ -1,3 +1,15 @@
+#ifdef USE_REAL_FFT
+typedef real PmeMeshValue;
+#define PME_MESH_STRIDE 1
+#define RECIP_GRID_SIZE_Z (GRID_SIZE_Z/2+1)
+__device__ inline real readPmeMesh(PmeMeshValue value) { return value; }
+#else
+typedef real2 PmeMeshValue;
+#define PME_MESH_STRIDE 2
+#define RECIP_GRID_SIZE_Z GRID_SIZE_Z
+__device__ inline real readPmeMesh(PmeMeshValue value) { return value.x; }
+#endif
+
 #define ARRAY(x,y) array[(x)-1+((y)-1)*PME_ORDER]
 /**
  * Calculate the spline coefficients for a single atom along a single axis.
@@ -422,7 +434,7 @@ extern "C" __global__ void transformPotentialToCartesianCoordinates(const real* 
 }
 
 extern "C" __global__ void gridSpreadFixedMultipoles(const real4* __restrict__ posq, const real* __restrict__ fracDipole,
-        const real* __restrict__ fracQuadrupole, const real* __restrict__ fracOctopole, real2* __restrict__ pmeGrid,
+        const real* __restrict__ fracQuadrupole, const real* __restrict__ fracOctopole, PmeMeshValue* __restrict__ pmeGrid,
         real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ, real3 recipBoxVecX, real3 recipBoxVecY, real3 recipBoxVecZ) {
 #if __CUDA_ARCH__ < 500
     real array[PME_ORDER*PME_ORDER];
@@ -516,7 +528,7 @@ extern "C" __global__ void gridSpreadFixedMultipoles(const real4* __restrict__ p
                     real add = term0*t.x + term1*t.y + term2*t.z + term3*t.w;
 #ifdef USE_DOUBLE_PRECISION
                     unsigned long long * ulonglong_p = (unsigned long long *) pmeGrid;
-                    atomicAdd(&ulonglong_p[2*index],  static_cast<unsigned long long>((long long) (add*0x100000000)));
+                    atomicAdd(&ulonglong_p[PME_MESH_STRIDE*index],  static_cast<unsigned long long>((long long) (add*0x100000000)));
 #else
                     atomicAdd(&pmeGrid[index].x, add);
 #endif
@@ -526,7 +538,7 @@ extern "C" __global__ void gridSpreadFixedMultipoles(const real4* __restrict__ p
    }
 }
 
-extern "C" __global__ void gridSpreadInducedDipoles(const real4* __restrict__ posq, const real* __restrict__ inducedDipole, real2* __restrict__ pmeGrid,
+extern "C" __global__ void gridSpreadInducedDipoles(const real4* __restrict__ posq, const real* __restrict__ inducedDipole, PmeMeshValue* __restrict__ pmeGrid,
         real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ, real3 recipBoxVecX, real3 recipBoxVecY, real3 recipBoxVecZ) {
 #if __CUDA_ARCH__ < 500
     real array[PME_ORDER*PME_ORDER];
@@ -612,7 +624,7 @@ extern "C" __global__ void gridSpreadInducedDipoles(const real4* __restrict__ po
                     real add1 = term01*t.x + term11*t.y;
 #ifdef USE_DOUBLE_PRECISION
                     unsigned long long * ulonglong_p = (unsigned long long *) pmeGrid;
-                    atomicAdd(&ulonglong_p[2*index],  static_cast<unsigned long long>((long long) (add1*0x100000000)));
+                    atomicAdd(&ulonglong_p[PME_MESH_STRIDE*index],  static_cast<unsigned long long>((long long) (add1*0x100000000)));
 #else
                     atomicAdd(&pmeGrid[index].x, add1);
 #endif
@@ -627,7 +639,7 @@ extern "C" __global__ void gridSpreadInducedDipoles(const real4* __restrict__ po
  */
 extern "C" __global__ void finishSpreadCharge(long long* __restrict__ pmeGrid) {
     real* floatGrid = (real*) pmeGrid;
-    const unsigned int gridSize = 2*GRID_SIZE_X*GRID_SIZE_Y*GRID_SIZE_Z;
+    const unsigned int gridSize = PME_MESH_STRIDE*GRID_SIZE_X*GRID_SIZE_Y*GRID_SIZE_Z;
     real scale = 1/(real) 0x100000000;
     for (int index = blockIdx.x*blockDim.x+threadIdx.x; index < gridSize; index += blockDim.x*gridDim.x)
         floatGrid[index] = scale*pmeGrid[index];
@@ -636,14 +648,14 @@ extern "C" __global__ void finishSpreadCharge(long long* __restrict__ pmeGrid) {
 extern "C" __global__ void reciprocalConvolution(real2* __restrict__ pmeGrid, const real* __restrict__ pmeBsplineModuliX,
         const real* __restrict__ pmeBsplineModuliY, const real* __restrict__ pmeBsplineModuliZ, real4 periodicBoxSize,
         real3 recipBoxVecX, real3 recipBoxVecY, real3 recipBoxVecZ) {
-    const unsigned int gridSize = GRID_SIZE_X*GRID_SIZE_Y*GRID_SIZE_Z;
+    const unsigned int gridSize = GRID_SIZE_X*GRID_SIZE_Y*RECIP_GRID_SIZE_Z;
     real expFactor = M_PI*M_PI/(EWALD_ALPHA*EWALD_ALPHA);
     real scaleFactor = RECIP(M_PI*periodicBoxSize.x*periodicBoxSize.y*periodicBoxSize.z);
     for (int index = blockIdx.x*blockDim.x+threadIdx.x; index < gridSize; index += blockDim.x*gridDim.x) {
-        int kx = index/(GRID_SIZE_Y*GRID_SIZE_Z);
-        int remainder = index-kx*GRID_SIZE_Y*GRID_SIZE_Z;
-        int ky = remainder/GRID_SIZE_Z;
-        int kz = remainder-ky*GRID_SIZE_Z;
+        int kx = index/(GRID_SIZE_Y*RECIP_GRID_SIZE_Z);
+        int remainder = index-kx*GRID_SIZE_Y*RECIP_GRID_SIZE_Z;
+        int ky = remainder/RECIP_GRID_SIZE_Z;
+        int kz = remainder-ky*RECIP_GRID_SIZE_Z;
         if (kx == 0 && ky == 0 && kz == 0) {
             pmeGrid[index] = make_real2(0, 0);
             continue;
@@ -661,11 +673,25 @@ extern "C" __global__ void reciprocalConvolution(real2* __restrict__ pmeGrid, co
         real m2 = mhx*mhx+mhy*mhy+mhz*mhz;
         real denom = m2*bx*by*bz;
         real eterm = scaleFactor*EXP(-expFactor*m2)/denom;
+#ifdef USE_REAL_FFT
+        // The legacy optimal-zeta indexing is asymmetric at the highest
+        // positive frequency of odd grids. Even-grid moduli can also differ
+        // at roundoff level. Reproduce REAL(IFFT(G*rho)) exactly in principle
+        // by using (G(k)+G(-k))/2, not by changing the legacy moduli convention.
+        // For this orthorhombic-only path, |k|^2 is identical at the conjugate.
+        int cx = (kx == 0 ? 0 : GRID_SIZE_X-kx);
+        int cy = (ky == 0 ? 0 : GRID_SIZE_Y-ky);
+        int cz = (kz == 0 ? 0 : GRID_SIZE_Z-kz);
+        real conjugateDenom = m2*pmeBsplineModuliX[cx]*pmeBsplineModuliY[cy]*pmeBsplineModuliZ[cz];
+        eterm = 0.5f*(eterm+scaleFactor*EXP(-expFactor*m2)/conjugateDenom);
+#endif
+        // No half-spectrum factor of two: Z2D reconstructs conjugate modes.
+        // Electrostatic energy is accumulated from the gathered real potential.
         pmeGrid[index] = make_real2(grid.x*eterm, grid.y*eterm);
     }
 }
 
-extern "C" __global__ void computeFixedPotentialFromGrid(const real2* __restrict__ pmeGrid, real* __restrict__ phi,
+extern "C" __global__ void computeFixedPotentialFromGrid(const PmeMeshValue* __restrict__ pmeGrid, real* __restrict__ phi,
         long long* __restrict__ fieldBuffers, const real4* __restrict__ posq,
         const real* __restrict__ labFrameDipole, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
         real3 recipBoxVecX, real3 recipBoxVecY, real3 recipBoxVecZ) {
@@ -786,7 +812,7 @@ extern "C" __global__ void computeFixedPotentialFromGrid(const real2* __restrict
                 for (int iz = 0; iz < PME_ORDER; iz++) {
                     int k = igrid3+iz-(igrid3+iz >= GRID_SIZE_Z ? GRID_SIZE_Z : 0);
                     int gridIndex = i*GRID_SIZE_Y*GRID_SIZE_Z + j*GRID_SIZE_Z + k;
-                    real tq = pmeGrid[gridIndex].x;
+                    real tq = readPmeMesh(pmeGrid[gridIndex]);
                     real5 &vadd = theta3[iz];
                     for (int ind = 0; ind < 5; ++ind)
                         v[ind] += tq*vadd[ind];
@@ -889,7 +915,7 @@ extern "C" __global__ void computeFixedPotentialFromGrid(const real2* __restrict
     }
 }
 
-extern "C" __global__ void computeInducedPotentialFromGrid(const real2* __restrict__ pmeGrid,
+extern "C" __global__ void computeInducedPotentialFromGrid(const PmeMeshValue* __restrict__ pmeGrid,
         real* __restrict__ phidp, const real4* __restrict__ posq,
         real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ, real3 recipBoxVecX,
         real3 recipBoxVecY, real3 recipBoxVecZ) {
@@ -996,7 +1022,7 @@ extern "C" __global__ void computeInducedPotentialFromGrid(const real2* __restri
                 for (int iz = 0; iz < PME_ORDER; iz++) {
                     int k = igrid3+iz-(igrid3+iz >= GRID_SIZE_Z ? GRID_SIZE_Z : 0);
                     int gridIndex = i*GRID_SIZE_Y*GRID_SIZE_Z + j*GRID_SIZE_Z + k;
-                    real tq = pmeGrid[gridIndex].x;
+                    real tq = readPmeMesh(pmeGrid[gridIndex]);
                     real5 &vadd = theta3[iz];
                     v[0] += tq*vadd[0];
                     v[1] += tq*vadd[1];

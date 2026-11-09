@@ -16,10 +16,11 @@ def sha256(path):
 
 def source_hashes():
     paths = [ROOT/'CMakeLists.txt', ROOT/'python/setup.py', ROOT/'python/CMakeLists.txt',
-             BASE/'phyneo_hexane_opls_md.xml', BASE/'native_dispersion/CMakeLists.txt']
+             BASE/'phyneo_hexane_opls_md.xml', BASE/'native_dispersion/CMakeLists.txt',
+             ROOT/'scripts/build_portable.sh', BASE/'native_dispersion/build.sh']
     for directory in ['openmmapi', 'serialization', 'platforms', 'python', 'mywork/native_dispersion/src']:
         paths.extend(p for p in (ROOT/directory).rglob('*') if p.is_file() and
-                     (p.suffix in ('.h', '.cpp', '.cu', '.i', '.cmake') or p.name == 'CMakeLists.txt'))
+                     (p.suffix in ('.h', '.cuh', '.cpp', '.cu', '.i', '.in', '.cmake') or p.name == 'CMakeLists.txt'))
     paths.append(BASE/'native_dispersion/vendor/pocketfft_hdronly.h')
     return {str(p.relative_to(ROOT)): sha256(p) for p in sorted(set(paths))}
 
@@ -52,8 +53,13 @@ def record_build():
     for path in files.values():
         if not path.is_file():
             raise FileNotFoundError(path)
+    cache = (BASE/'native_dispersion/build/CMakeCache.txt').read_text()
+    for option in ('NATIVE_DISPERSION_ALL_PAIRS', 'NATIVE_DISPERSION_COMPLEX_FFT'):
+        if f'{option}:BOOL=OFF' not in cache.splitlines():
+            raise RuntimeError(f'{option} must be OFF for this optimized MD workflow')
     # Hashing a successful build is provenance, NOT scientific/GPU validation.
     data = dict(python_prefix=str(prefix), source_sha256=source_hashes(), gpu_validation=None,
+                implementation='real-pme-fft-and-cell-verlet-v1',
                 files={k: dict(path=str(p.resolve()), sha256=sha256(p)) for k, p in files.items()})
     MANIFEST.write_text(json.dumps(data, indent=2)+'\n')
     print('Recorded local build. Run python mywork/validate_build.py on a GPU node before MD.')

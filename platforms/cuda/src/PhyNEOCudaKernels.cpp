@@ -112,7 +112,8 @@ CudaCalcPhyNEOForceKernel::CudaCalcPhyNEOForceKernel(std::string name, const Pla
         inducedDipoleFieldGradient(NULL), extrapolatedDipoleField(NULL), extrapolatedDipoleFieldGradient(NULL),
         covalentFlags(NULL), mScaleFactors(NULL), pScaleFactors(NULL), dScaleFactors(NULL),
         pmeGrid(NULL), pmeBsplineModuliX(NULL), pmeBsplineModuliY(NULL), pmeBsplineModuliZ(NULL), pmeIgrid(NULL), pmePhi(NULL),
-        pmePhid(NULL), pmePhip(NULL), pmePhidp(NULL), pmeCphi(NULL), lastPositions(NULL), sort(NULL) {
+        pmePhid(NULL), pmePhip(NULL), pmePhidp(NULL), pmeCphi(NULL), lastPositions(NULL), sort(NULL),
+        useRealFFT(false), pmeSpectrum(NULL), fft(0), inverseFFT(0) {
 }
 
 CudaCalcPhyNEOForceKernel::~CudaCalcPhyNEOForceKernel() {
@@ -185,6 +186,8 @@ CudaCalcPhyNEOForceKernel::~CudaCalcPhyNEOForceKernel() {
         delete dScaleFactors;
     if (pmeGrid != NULL)
         delete pmeGrid;
+    if (pmeSpectrum != NULL)
+        delete pmeSpectrum;
     if (pmeBsplineModuliX != NULL)
         delete pmeBsplineModuliX;
     if (pmeBsplineModuliY != NULL)
@@ -207,8 +210,10 @@ CudaCalcPhyNEOForceKernel::~CudaCalcPhyNEOForceKernel() {
         delete lastPositions;
     if (sort != NULL)
         delete sort;
-    if (hasInitializedFFT)
+    if (fft != 0)
         cufftDestroy(fft);
+    if (inverseFFT != 0)
+        cufftDestroy(inverseFFT);
     if (hasCreatedEvent)
         cuEventDestroy(syncEvent);
 }
@@ -512,7 +517,17 @@ void CudaCalcPhyNEOForceKernel::initialize(const System& system, const PhyNEOFor
     if (usePME) {
         // Create the PME kernels.
 
+        Vec3 boxA, boxB, boxC;
+        system.getDefaultPeriodicBoxVectors(boxA, boxB, boxC);
+        // Preserve the complex path for single/mixed and initially triclinic
+        // systems. The production runner supports orthorhombic CUDA double.
+        useRealFFT = cu.getUseDoublePrecision() &&
+            boxA[1] == 0 && boxA[2] == 0 && boxB[0] == 0 &&
+            boxB[2] == 0 && boxC[0] == 0 && boxC[1] == 0;
+
         map<string, string> pmeDefines;
+        if (useRealFFT)
+            pmeDefines["USE_REAL_FFT"] = "";
         pmeDefines["EWALD_ALPHA"] = cu.doubleToString(alpha);
         pmeDefines["PME_ORDER"] = cu.intToString(PmeOrder);
         pmeDefines["NUM_ATOMS"] = cu.intToString(numMultipoles);
@@ -549,7 +564,9 @@ void CudaCalcPhyNEOForceKernel::initialize(const System& system, const PhyNEOFor
         // Create required data structures.
 
         int elementSize = (cu.getUseDoublePrecision() ? sizeof(double) : sizeof(float));
-        pmeGrid = new CudaArray(cu, gridSizeX*gridSizeY*gridSizeZ, 2*elementSize, "pmeGrid");
+        pmeGrid = new CudaArray(cu, gridSizeX*gridSizeY*gridSizeZ, (useRealFFT ? 1 : 2)*elementSize, "pmeGrid");
+        if (useRealFFT)
+            pmeSpectrum = new CudaArray(cu, gridSizeX*gridSizeY*(gridSizeZ/2+1), 2*elementSize, "pmeSpectrum");
         cu.addAutoclearBuffer(*pmeGrid);
         pmeBsplineModuliX = new CudaArray(cu, gridSizeX, elementSize, "pmeBsplineModuliX");
         pmeBsplineModuliY = new CudaArray(cu, gridSizeY, elementSize, "pmeBsplineModuliY");
@@ -562,9 +579,15 @@ void CudaCalcPhyNEOForceKernel::initialize(const System& system, const PhyNEOFor
         pmeCphi = new CudaArray(cu, 20*numMultipoles, elementSize, "pmeCphi");
         pmeAtomRange = CudaArray::create<int>(cu, gridSizeX*gridSizeY*gridSizeZ+1, "pmeAtomRange");
         sort = new CudaSort(cu, new SortTrait(), cu.getNumAtoms());
-        cufftResult result = cufftPlan3d(&fft, gridSizeX, gridSizeY, gridSizeZ, cu.getUseDoublePrecision() ? CUFFT_Z2Z : CUFFT_C2C);
+        cufftResult result = cufftPlan3d(&fft, gridSizeX, gridSizeY, gridSizeZ,
+                                       useRealFFT ? CUFFT_D2Z : (cu.getUseDoublePrecision() ? CUFFT_Z2Z : CUFFT_C2C));
         if (result != CUFFT_SUCCESS)
             throw OpenMMException("Error initializing FFT: "+cu.intToString(result));
+        if (useRealFFT) {
+            result = cufftPlan3d(&inverseFFT, gridSizeX, gridSizeY, gridSizeZ, CUFFT_Z2D);
+            if (result != CUFFT_SUCCESS)
+                throw OpenMMException("Error initializing inverse real FFT: "+cu.intToString(result));
+        }
         hasInitializedFFT = true;
 
         // Initialize the b-spline moduli.
@@ -735,7 +758,10 @@ void CudaCalcPhyNEOForceKernel::initializeScaleFactors() {
             }
         }
     }
-    // Avoid int overflow in CudaArray::upload for scale matrices above 2 GiB.
+    // CudaArray::uploadSubArray uses int elements*elementSize in some OpenMM
+    // versions.  A dense float scale matrix exceeds INT_MAX bytes already at
+    // 23171 atoms, even though its element count still fits in an int.
+    // Use the CUDA driver's size_t byte count directly (synchronous, as before).
     auto uploadScaleFactors = [&](CudaArray& array, const vector<float>& values) {
         CUresult result = cuMemcpyHtoD(array.getDevicePointer(), values.data(), values.size()*sizeof(float));
         CHECK_RESULT(result, "Error uploading array " + array.getName());
@@ -795,7 +821,25 @@ void CudaCalcPhyNEOForceKernel::initializeScaleFactors() {
 
 }
 
+void CudaCalcPhyNEOForceKernel::executePmeFFT(bool forward) {
+    cufftResult result;
+    if (useRealFFT) {
+        if (forward)
+            result = cufftExecD2Z(fft, (double*) pmeGrid->getDevicePointer(), (double2*) pmeSpectrum->getDevicePointer());
+        else
+            result = cufftExecZ2D(inverseFFT, (double2*) pmeSpectrum->getDevicePointer(), (double*) pmeGrid->getDevicePointer());
+    }
+    else if (cu.getUseDoublePrecision())
+        result = cufftExecZ2Z(fft, (double2*) pmeGrid->getDevicePointer(), (double2*) pmeGrid->getDevicePointer(), forward ? CUFFT_FORWARD : CUFFT_INVERSE);
+    else
+        result = cufftExecC2C(fft, (float2*) pmeGrid->getDevicePointer(), (float2*) pmeGrid->getDevicePointer(), forward ? CUFFT_FORWARD : CUFFT_INVERSE);
+    if (result != CUFFT_SUCCESS)
+        throw OpenMMException("Error executing PME FFT: "+cu.intToString(result));
+}
+
 double CudaCalcPhyNEOForceKernel::execute(ContextImpl& context, bool includeForces, bool includeEnergy) {
+    // OpenMM itself requires Context reinitialization when changing an initially
+    // rectangular box to triclinic. Reinitialization selects the complex path.
     if (!hasInitializedScaleFactors) {
         initializeScaleFactors();
     }
@@ -872,6 +916,7 @@ double CudaCalcPhyNEOForceKernel::execute(ContextImpl& context, bool includeForc
 
         // Reciprocal space calculation.
 
+        CudaArray* reciprocalGrid = useRealFFT ? pmeSpectrum : pmeGrid;
         unsigned int maxTiles = nb.getInteractingTiles().getSize();
         void* pmeTransformMultipolesArgs[] = {&labFrameDipoles->getDevicePointer(), &labFrameQuadrupoles->getDevicePointer(), &labFrameOctopoles->getDevicePointer(),
             &fracDipoles->getDevicePointer(), &fracQuadrupoles->getDevicePointer(), &fracOctopoles->getDevicePointer(), recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2]};
@@ -883,17 +928,11 @@ double CudaCalcPhyNEOForceKernel::execute(ContextImpl& context, bool includeForc
         void* finishSpreadArgs[] = {&pmeGrid->getDevicePointer()};
         if (cu.getUseDoublePrecision())
             cu.executeKernel(pmeFinishSpreadChargeKernel, finishSpreadArgs, pmeGrid->getSize());
-        if (cu.getUseDoublePrecision())
-            cufftExecZ2Z(fft, (double2*) pmeGrid->getDevicePointer(), (double2*) pmeGrid->getDevicePointer(), CUFFT_FORWARD);
-        else
-            cufftExecC2C(fft, (float2*) pmeGrid->getDevicePointer(), (float2*) pmeGrid->getDevicePointer(), CUFFT_FORWARD);
-        void* pmeConvolutionArgs[] = {&pmeGrid->getDevicePointer(), &pmeBsplineModuliX->getDevicePointer(), &pmeBsplineModuliY->getDevicePointer(),
+        executePmeFFT(true);
+        void* pmeConvolutionArgs[] = {&reciprocalGrid->getDevicePointer(), &pmeBsplineModuliX->getDevicePointer(), &pmeBsplineModuliY->getDevicePointer(),
             &pmeBsplineModuliZ->getDevicePointer(), cu.getPeriodicBoxSizePointer(), recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2]};
-        cu.executeKernel(pmeConvolutionKernel, pmeConvolutionArgs, gridSizeX*gridSizeY*gridSizeZ, 256);
-        if (cu.getUseDoublePrecision())
-            cufftExecZ2Z(fft, (double2*) pmeGrid->getDevicePointer(), (double2*) pmeGrid->getDevicePointer(), CUFFT_INVERSE);
-        else
-            cufftExecC2C(fft, (float2*) pmeGrid->getDevicePointer(), (float2*) pmeGrid->getDevicePointer(), CUFFT_INVERSE);
+        cu.executeKernel(pmeConvolutionKernel, pmeConvolutionArgs, reciprocalGrid->getSize(), 256);
+        executePmeFFT(false);
         void* pmeFixedPotentialArgs[] = {&pmeGrid->getDevicePointer(), &pmePhi->getDevicePointer(), &field->getDevicePointer(),
             &cu.getPosq().getDevicePointer(), &labFrameDipoles->getDevicePointer(),
             cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
@@ -921,27 +960,26 @@ double CudaCalcPhyNEOForceKernel::execute(ContextImpl& context, bool includeForc
         cu.executeKernel(recordInducedDipolesKernel, recordInducedDipolesArgs, cu.getNumAtoms());
 
         // Reciprocal space calculation for the induced dipoles.
-
-        cu.clearBuffer(*pmeGrid);
-        void* pmeSpreadInducedDipolesArgs[] = {&cu.getPosq().getDevicePointer(), &inducedDipole->getDevicePointer(),
-            &pmeGrid->getDevicePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
-            recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2]};
-        cu.executeKernel(pmeSpreadInducedDipolesKernel, pmeSpreadInducedDipolesArgs, cu.getNumAtoms());
-        if (cu.getUseDoublePrecision())
-            cu.executeKernel(pmeFinishSpreadChargeKernel, finishSpreadArgs, pmeGrid->getSize());
-        if (cu.getUseDoublePrecision())
-            cufftExecZ2Z(fft, (double2*) pmeGrid->getDevicePointer(), (double2*) pmeGrid->getDevicePointer(), CUFFT_FORWARD);
-        else
-            cufftExecC2C(fft, (float2*) pmeGrid->getDevicePointer(), (float2*) pmeGrid->getDevicePointer(), CUFFT_FORWARD);
-        cu.executeKernel(pmeConvolutionKernel, pmeConvolutionArgs, gridSizeX*gridSizeY*gridSizeZ, 256);
-        if (cu.getUseDoublePrecision())
-            cufftExecZ2Z(fft, (double2*) pmeGrid->getDevicePointer(), (double2*) pmeGrid->getDevicePointer(), CUFFT_INVERSE);
-        else
-            cufftExecC2C(fft, (float2*) pmeGrid->getDevicePointer(), (float2*) pmeGrid->getDevicePointer(), CUFFT_INVERSE);
-        void* pmeInducedPotentialArgs[] = {&pmeGrid->getDevicePointer(), &pmePhidp->getDevicePointer(),
-           &cu.getPosq().getDevicePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(),
-            cu.getPeriodicBoxVecZPointer(), recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2]};
-        cu.executeKernel(pmeInducedPotentialKernel, pmeInducedPotentialArgs, cu.getNumAtoms());
+        // For mutual polarization with at least one iteration, the first
+        // computeInducedField() immediately recomputes and overwrites pmePhidp
+        // for these same dipoles before any consumer reads it. Keep the original
+        // initialization for other modes and zero-iteration configurations.
+        if (polarizationType != PhyNEOForce::Mutual || maxInducedIterations <= 0) {
+            cu.clearBuffer(*pmeGrid);
+            void* pmeSpreadInducedDipolesArgs[] = {&cu.getPosq().getDevicePointer(), &inducedDipole->getDevicePointer(),
+                &pmeGrid->getDevicePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
+                recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2]};
+            cu.executeKernel(pmeSpreadInducedDipolesKernel, pmeSpreadInducedDipolesArgs, cu.getNumAtoms());
+            if (cu.getUseDoublePrecision())
+                cu.executeKernel(pmeFinishSpreadChargeKernel, finishSpreadArgs, pmeGrid->getSize());
+            executePmeFFT(true);
+            cu.executeKernel(pmeConvolutionKernel, pmeConvolutionArgs, reciprocalGrid->getSize(), 256);
+            executePmeFFT(false);
+            void* pmeInducedPotentialArgs[] = {&pmeGrid->getDevicePointer(), &pmePhidp->getDevicePointer(),
+               &cu.getPosq().getDevicePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(),
+                cu.getPeriodicBoxVecZPointer(), recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2]};
+            cu.executeKernel(pmeInducedPotentialKernel, pmeInducedPotentialArgs, cu.getNumAtoms());
+        }
 
         // Iterate until the dipoles converge.
 
@@ -1044,17 +1082,12 @@ void CudaCalcPhyNEOForceKernel::computeInducedField(void** recipBoxVectorPointer
             void* finishSpreadArgs[] = {&pmeGrid->getDevicePointer()};
             cu.executeKernel(pmeFinishSpreadChargeKernel, finishSpreadArgs, pmeGrid->getSize());
         }
-        if (cu.getUseDoublePrecision())
-            cufftExecZ2Z(fft, (double2*) pmeGrid->getDevicePointer(), (double2*) pmeGrid->getDevicePointer(), CUFFT_FORWARD);
-        else
-            cufftExecC2C(fft, (float2*) pmeGrid->getDevicePointer(), (float2*) pmeGrid->getDevicePointer(), CUFFT_FORWARD);
-        void* pmeConvolutionArgs[] = {&pmeGrid->getDevicePointer(), &pmeBsplineModuliX->getDevicePointer(), &pmeBsplineModuliY->getDevicePointer(),
+        executePmeFFT(true);
+        CudaArray* reciprocalGrid = useRealFFT ? pmeSpectrum : pmeGrid;
+        void* pmeConvolutionArgs[] = {&reciprocalGrid->getDevicePointer(), &pmeBsplineModuliX->getDevicePointer(), &pmeBsplineModuliY->getDevicePointer(),
             &pmeBsplineModuliZ->getDevicePointer(), cu.getPeriodicBoxSizePointer(), recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2]};
-        cu.executeKernel(pmeConvolutionKernel, pmeConvolutionArgs, gridSizeX*gridSizeY*gridSizeZ, 256);
-        if (cu.getUseDoublePrecision())
-            cufftExecZ2Z(fft, (double2*) pmeGrid->getDevicePointer(), (double2*) pmeGrid->getDevicePointer(), CUFFT_INVERSE);
-        else
-            cufftExecC2C(fft, (float2*) pmeGrid->getDevicePointer(), (float2*) pmeGrid->getDevicePointer(), CUFFT_INVERSE);
+        cu.executeKernel(pmeConvolutionKernel, pmeConvolutionArgs, reciprocalGrid->getSize(), 256);
+        executePmeFFT(false);
         void* pmeInducedPotentialArgs[] = {&pmeGrid->getDevicePointer(),
             &pmePhidp->getDevicePointer(), &cu.getPosq().getDevicePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(),
             cu.getPeriodicBoxVecZPointer(), recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2]};

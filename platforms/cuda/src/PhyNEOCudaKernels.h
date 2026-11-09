@@ -131,6 +131,7 @@ private:
         const char* getSortKey() const {return "value.y";}
     };
     void initializeScaleFactors();
+    void executePmeFFT(bool forward);
     void computeInducedField(void** recipBoxVectorPointer);
     bool iterateDipolesByDIIS(int iteration);
     void computeExtrapolatedDipoles(void** recipBoxVectorPointer);
@@ -141,6 +142,7 @@ private:
     int gridSizeX, gridSizeY, gridSizeZ;
     double alpha, inducedEpsilon;
     bool usePME, hasQuadrupoles, hasOctopoles, hasInitializedScaleFactors, hasInitializedFFT, multipolesAreValid, hasCreatedEvent;
+    bool useRealFFT;
     PhyNEOForce::PolarizationType polarizationType;
     CudaContext& cu;
     const System& system;
@@ -184,6 +186,7 @@ private:
     CudaArray* pScaleFactors;
     CudaArray* dScaleFactors;
     CudaArray* pmeGrid;
+    CudaArray* pmeSpectrum;
     CudaArray* pmeBsplineModuliX;
     CudaArray* pmeBsplineModuliY;
     CudaArray* pmeBsplineModuliZ;
@@ -197,6 +200,7 @@ private:
     CudaArray* lastPositions;
     CudaSort* sort;
     cufftHandle fft;
+    cufftHandle inverseFFT;
     CUfunction computeMomentsKernel, recordInducedDipolesKernel, computeFixedFieldKernel, computeInducedFieldKernel, updateInducedFieldKernel, electrostaticsKernel, mapTorqueKernel;
     CUfunction pmeSpreadFixedMultipolesKernel, pmeSpreadInducedDipolesKernel, pmeFinishSpreadChargeKernel, pmeConvolutionKernel;
     CUfunction pmeFixedPotentialKernel, pmeInducedPotentialKernel, pmeFixedForceKernel, pmeInducedForceKernel, pmeRecordInducedFieldDipolesKernel, computePotentialKernel;
